@@ -1,0 +1,57 @@
+Implementare Protocol de Transport Fiabil peste UDP
+
+Descriere generala
+Aceasta tema implementeaza un protocol de transport fiabil peste UDP, inspirat din mecanismele de baza ale TCP. Protocolul foloseste ferestre glisante atat la sender cat si la receiver pentru a utiliza link-ul in mod optim, adica pentru a putea avea mai multe pachete in zbor simultan fara sa asteptam ACK pentru fiecare in parte. Pe langa asta, am implementat controlul fluxului prin care receptorul ii comunica senderului cat spatiu liber mai are in buffer, handshake-ul in trei pasi pentru stabilirea conexiunii si retransmisia automata bazata pe timer.
+Implementarea e impartita in doua fisiere principale: libsend.cpp si librecv.cpp. Fiecare are un thread dedicat (sender_handler si receiver_handler) care ruleaza in background si se ocupa de trimiterea/receptionarea pachetelor, in timp ce thread-ul principal al aplicatiei apeleaza send_data si recv_data.
+
+Structurile de date
+struct sender retine toata starea capatului emitator al unei conexiuni.
+ - base_seq e numarul de secventa al primului segment trimis dar inca neconfirmat, adica marginea stanga a ferestrei de trimitere. next_seq e numarul de secventa care va fi atribuit urmatorului pachet nou. max_window_seq e numarul maxim de pachete care pot fi simultan in zbor, calculat la initializare din bandwidth-delay product. spatiu_liber_receptor e valoarea recv_window citita din ultimul ACK primit, senderul nu va trimite mai multi octeti decat permite receptorul.
+ - buffer e o coada de vectori de octeti in care send_data depune chunk-urile primite de la aplicatie, iar thread-ul sender le consuma si le trimite pe retea. bytes_used si buffer_cap urmaresc ocuparea acestui buffer intern, capacitatea fiind de 256 KB. fereastra_glisanta_trimisa e un map indexat dupa numarul de secventa care pastreaza copii complete ale pachetelor trimise dar neconfirmate inca, folosit pentru retransmisie la timeout si pentru stergere la primirea ACK-urilor.
+struct receiver retine toata starea capatului receptor.
+ - expected_seq e numarul de secventa al primului pachet care lipseste din sirul continuu primit, adica valoarea ACK pe care o trimitem inapoi senderului. Cand primim pachete consecutive, expected_seq avanseaza. last_read_seq e numarul de secventa al urmatorului pachet pe care aplicatia il va citi prin recv_data, si el avanseaza pe masura ce aplicatia consuma datele.
+ - window_size e dimensiunea ferestrei de receptie exprimata in numar de pachete, calculata ca buffer_cap / MAX_DATA_SIZE. buffer_cap e capacitatea totala a bufferului de receptie (primita ca parametru in init_receiver), iar recv_buffer_used e numarul de octeti ocupati in prezent. Diferenta dintre ele e valoarea pusa in recv_window la fiecare ACK trimis. fereastra_glisanta_primita e un map indexat dupa numarul de secventa in care stocam payload-urile pachetelor primite, inclusiv cele sosite out-of-order dar inca in fereastra activa.
+
+
+Protocolul nu foloseste ACK-uri selective individuale; ACK-urile sunt cumulative, iar receiverul poate pastra segmente out-of-order pana cand lipsurile sunt completate. La timeout, senderul retransmite segmentele ramase neconfirmate.
+
+Stabilirea conexiunii - Three-Way Handshake
+Receiver (wait4connect)
+Receptorul asculta pe portul 8032 pe socket-ul listenfd. Asteapta in bucla pana primeste un pachet cu type == SYN si protocol_id valid. La primire, aloca o noua structura connection, initializeaza campurile de receiver si creeaza un socket UDP nou legat pe un port dinamic ales de sistem prin bind cu portul 0.
+Afla portul alocat cu getsockname, apoi construieste pachetul SYN-ACK: un poli_tcp_ctrl_hdr cu type = SYN_ACK, recv_window setat la dimensiunea bufferului, urmat de portul de date in network byte order. Pachetul SYN-ACK e trimis pe listenfd inapoi la client.
+Dupa asta intra intr-o bucla cu timeout de 200ms in care asteapta ACK-ul final al clientului pe noul socket. Daca nu vine, retrimite SYN-ACK. Cand primeste ACK valid, iese din bucla, dezactiveaza timeout-ul, initializeaza mutex-ul conexiunii si adauga conexiunea in map-ul global cons. Adauga si socket-ul in tablourile data_fds si timer_fds cu un timer de 1 secunda.
+
+Sender (setup_connection)
+Senderul creeaza un socket UDP, initializeaza structura connection cu base_seq = 0, next_seq = 0, max_window_seq = window_size calculat din BDP, buffer_cap = 256 KB. Seteaza un timeout de 200ms pe socket si intra in bucla: trimite SYN pe portul 8032, asteapta SYN-ACK. Daca nu vine in 200ms reia. Valideaza ca raspunsul e SYN-ACK cu protocol_id corect.
+La primire, extrage portul de date din cei 2 bytes de dupa header, citeste conn_id si recv_window din SYN-ACK, actualizeaza servaddr cu noul port si trimite ACK-ul final pe noul port. Dezactiveaza timeout-ul, adauga conexiunea in cons, configureaza data_fds si timer_fds cu un timer de 50ms si returneaza conn_id.
+
+
+Fereastra glisanta la sender
+Fereastra la sender are doua limite: max_window_seq care e numarul maxim de pachete in zbor si spatiu_liber_receptor care e numarul maxim de octeti in zbor din perspectiva bufferului receptorului.
+send_data - nu trimite direct nimic pe retea. Verifica ca bytes_used + len nu depaseste buffer_cap, apoi imparte datele in chunk-uri de maxim MAX_DATA_SIZE bytes si le pune in coada buffer. Actualizeza bytes_used si returneaza numarul de octeti acceptati.
+sender_handler - itereaza continuu peste toate conexiunile active. Pentru fiecare conexiune, cat timp coada buffer nu e goala, verifica doua conditii inainte sa trimita: numarul de pachete din fereastra_glisanta_trimisa sa fie sub max_window_seq, si octeti_in_zbor calculati de get_bytes_in_flight sa nu depaseasca spatiu_liber_receptor. Daca ambele sunt ok, scoate un chunk din coada, construieste pachetul complet cu header , il trimite cu sendto, il salveaza in fereastra_glisanta_trimisa cu cheia next_seq, incrementeaza next_seq si scade bytes_used.
+Dupa ce epuizeaza ce poate trimite, apeleaza recv_message_or_timeout pentru a procesa ACK-uri sau timeouturi. La un ACK cumulativ valid, sterge din fereastra_glisanta_trimisa toate intrarile cu index mai mic decat ack_num, actualizeaza base_seq si citeste noul spatiu_liber_receptor din recv_window. La timeout (res == -1) retrimite toate pachetele din fereastra_glisanta_trimisa in ordine.
+
+
+Fereastra glisanta la receiver
+Fereastra la receiver accepta pachete cu numere de secventa in intervalul [expected_seq, expected_seq + window_size). Orice pachet cu seq_num in afara acestui interval e aruncat. Asta permite receptorului sa accepte pachete out-of-order atata timp cat se incadreaza in fereastra.
+receiver_handler (thread de background) asteapta segmente prin recv_message_or_timeout. Pentru fiecare pachet DATA valid (protocol_id corect, type == DATA, conn_id potrivit, dimensiune suficienta, len <= MAX_DATA_SIZE), verifica ca seq_num e in fereastra activa. Daca pachetul nu e deja in map si exista spatiu in buffer (recv_buffer_used + len <= buffer_cap), salveaza payload-ul in fereastra_glisanta_primita la cheia seq_num si adauga len la recv_buffer_used. Dupa inserare, avanseaza expected_seq cat timp fereastra_glisanta_primita contine expected_seq consecutiv. Pentru fiecare segment DATA valid procesat, receiverul trimite ACK cu valoarea curenta a expected_seq.
+recv_data - livreaza datele in ordine. Asteapta in bucla cu usleep(1000) pana cand last_read_seq e disponibil in fereastra_glisanta_primita. Cand e disponibil, copiaza payload-ul in bufferul aplicatiei. Daca pachetul incape complet, il sterge din map si incrementeaza last_read_seq. Daca nu incape tot, copiaza cat incape, sterge octetii consumati din vector cu erase si se opreste. La final, daca a copiat cel putin un octet, trimite ACK cu expected_seq curent pentru a semnala senderului ca s-a eliberat spatiu in buffer.
+
+Controlul fluxului
+La fiecare ACK trimis de receiver , campul recv_window e calculat ca buffer_cap - recv_buffer_used, adica spatiul ramas liber in bufferul de receptie. Valoarea e limitata la intervalul [0, 65535] si pusa in htons.
+Senderul citeste acest camp la fiecare ACK primit si il salveaza in spatiu_liber_receptor. Inainte sa trimita urmatorul pachet, verifica ca bytes_in_zbor + len_payload_urmator <= spatiu_liber_receptor. Daca receptorul e plin, senderul se opreste sa trimita pana primeste un nou ACK cu recv_window mai mare. Astfel, senderul nu poate depasi capacitatea bufferului de la receptor, chiar daca fereastra proprie i-ar permite sa trimita mai mult.
+
+
+Dimensionarea ferestrei in init_sender
+init_sender primeste viteza legaturii in Mbps si delay-ul one-way in ms. RTT-ul este aproximat ca 2 * delay, apoi calculeaza:
+    speed_bytes_per_sec = speed * 1000000 / 8
+    delay_sec = delay / 1000
+    BDP = speed_bytes_per_sec * 2 * delay_sec
+    window_size = BDP / MAX_DATA_SIZE
+Logica e ca pentru a utiliza link-ul la capacitate maxima trebuie sa avem mereu suficiente date in zbor cat sa umple pipe-ul, adica BDP bytes. window_size e setat la minim 16 pachete pentru conexiuni cu BDP mic. Aceasta valoare devine max_window_seq la sender.
+Timerul de retransmisie al senderului e setat la 50000000 ns, pentru a detecta rapid pierderile si a retransmite fara sa pierdem prea mult timp asteptand.
+
+
+Sincronizare
+Fiecare conexiune are un pthread_mutex_t con_lock propriu. Mutex-ul e luat de send_data si recv_data care ruleaza pe thread-ul principal, dar si de sender_handler si receiver_handler care ruleaza in background, de fiecare data cand acceseaza structurile interne ale conexiunii (fereastra, buffer, contoare). Asta previne race conditions intre producatorii de date si consumatorii lor. In recv_data, bucla de asteptare elibereaza mutex-ul inainte de usleep si il reachizitioneaza dupa, ca sa nu blocheze receiver_handler care trebuie sa insereze pachete.
